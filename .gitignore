@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# локальные настройки Claude Code
+.claude/
+
+# редакторы
+.idea/
+.vscode/
+*.swp
+
+# на случай, если появятся тесты на node
+node_modules/
