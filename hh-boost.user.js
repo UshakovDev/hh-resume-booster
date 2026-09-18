@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         hh.ru — автоподнятие резюме
 // @namespace    dmitriy.hh.boost
-// @version      1.4.0
+// @version      1.4.1
 // @description  Раз в 4 часа жмёт «Поднять в поиске» на hh.ru. Работает в настоящем браузере с настоящей сессией; переживает сон ноутбука, потому что сверяется с абсолютным временем, а не с таймером.
 // @match        https://hh.ru/applicant/*
 // @match        https://*.hh.ru/applicant/*
@@ -199,17 +199,34 @@
     fire('click');
   }
 
-  // hh любит показать после поднятия модалку с платным продвижением
+  // После поднятия hh показывает модалку с предложением hh PRO. Для самого скрипта
+  // она безвредна: перед следующим поднятием страница всё равно перезагрузится, а клик
+  // мы отправляем прямо на элемент, так что перекрытие ему не мешает. Но оставлять её
+  // висеть перед глазами не надо — ждём её появления и закрываем.
+  const MODAL_SEL = '[role="dialog"], [data-qa*="modal"], [class*="Modal"], [class*="odal-window"]';
+  const CLOSE_SEL = '[data-qa*="close"], [data-qa*="Close"], [aria-label*="акрыть"],' +
+                    '[title*="акрыть"], [class*="close"], [class*="Close"]';
+
   async function closeModals() {
-    for (let i = 0; i < 3; i++) {
-      const dialog = document.querySelector('[role="dialog"], [data-qa*="modal"], [class*="Modal"]');
-      if (!dialog || !isVisible(dialog)) return;
-      const close = dialog.querySelector(
-        '[data-qa*="close"], [aria-label*="акрыть"], [class*="close"], button[title*="акрыть"]');
-      if (close) click(close);
-      else document.dispatchEvent(new KeyboardEvent('keydown',
-        { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
-      await sleep(800);
+    const deadline = Date.now() + 6000;
+    let tries = 0;
+    while (Date.now() < deadline && tries < 4) {
+      const dialog = document.querySelector(MODAL_SEL);
+      if (dialog && isVisible(dialog)) {
+        tries++;
+        const close = dialog.querySelector(CLOSE_SEL);
+        if (close) {
+          click(close);
+        } else {
+          const esc = makeEvent(KeyboardEvent, 'keydown',
+            { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true });
+          if (esc) {
+            document.dispatchEvent(esc);
+            dialog.dispatchEvent(esc);
+          }
+        }
+      }
+      await sleep(700);
     }
   }
 
@@ -590,7 +607,7 @@
   }
 
   // ─── Старт ──────────────────────────────────────────────────────────────
-  console.log('[hh-boost] v1.4.0 загружен:', location.href);
+  console.log('[hh-boost] v1.4.1 загружен:', location.href);
   try {
     buildBadge();
     render();
