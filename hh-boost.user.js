@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         hh.ru — автоподнятие резюме
 // @namespace    dmitriy.hh.boost
-// @version      1.3.0
+// @version      1.4.0
 // @description  Раз в 4 часа жмёт «Поднять в поиске» на hh.ru. Работает в настоящем браузере с настоящей сессией; переживает сон ноутбука, потому что сверяется с абсолютным временем, а не с таймером.
 // @match        https://hh.ru/applicant/*
 // @match        https://*.hh.ru/applicant/*
@@ -24,9 +24,12 @@
   const MIN_RELOAD_GAP = 5 * 60 * 1000;            // страховка от петли перезагрузок
   const TICK           = 30 * 1000;                // как часто сверяемся с часами
   const WAIT_BUTTON    = 25 * 1000;                // сколько ждём появления кнопки
-  const WAIT_CONFIRM   = 15 * 1000;                // сколько ждём подтверждения клика
+  const WAIT_CONFIRM   = 5 * 1000;                 // сколько ждём отклика hh после одного нажатия
   const MAX_FAILS      = 3;                        // после скольких неудач замолкаем
   const LOG_SIZE       = 25;
+  const HYDRATION_DELAY  = 4 * 1000;               // пауза после загрузки: ждём, пока React оживит кнопку
+  const CLICK_ATTEMPTS   = 3;                      // сколько раз пробуем нажать за один заход
+  const PENDING_RECHECK  = 2 * 60 * 1000;          // через сколько перепроверяем неподтверждённый клик
 
   // ─── Хранилище ──────────────────────────────────────────────────────────
   const KEY = 'hhBoost:';
@@ -237,26 +240,43 @@
     return false;
   }
 
-  // Проверяем результат по пяти независимым признакам: достаточно любого.
-  async function verifyBoosted(btn, stampBefore, timeout) {
+  // Подтверждаем ТОЛЬКО по положительным признакам — по тому, что hh что-то сказал
+  // или показал. Исчезновение кнопки успехом не считается: React на hh пересобирает
+  // узлы при гидратации и перерисовках, и на этом легко поймать ложное «поднято».
+  async function waitConfirmed(stampBefore, hintBefore, timeout) {
     const deadline = Date.now() + timeout;
-    while (Date.now() < deadline) {
-      await sleep(500);
+    for (;;) {
+      if (successMessage()) return true;                  // «Успешно поднято»
 
-      if (btn && !btn.isConnected) return true;           // 1. hh убрал кнопку со страницы
-      if (successMessage()) return true;                  // 2. «Успешно поднято»
-
-      const stamp = updatedStamp();                       // 3. дата резюме переписалась
+      const stamp = updatedStamp();                       // дата резюме переписалась
       if (stampBefore && stamp && stamp !== stampBefore) return true;
 
-      const hint = findNextTimeHint();                    // 4. hh показал свой таймер
-      if (hint && hint > Date.now() + 30 * 60 * 1000) return hint;
+      // таймер, которого до клика не было
+      const hint = findNextTimeHint();
+      if (hint && !hintBefore && hint > Date.now() + 30 * 60 * 1000) return hint;
 
-      const b = findBoostButton();                        // 5. кнопка пропала или погасла
-      if (!b) return true;
-      if (isDisabled(b)) return true;
+      if (Date.now() >= deadline) return false;
+      await sleep(500);
     }
-    return false;
+  }
+
+  // Кнопку ищем заново перед каждой попыткой: React подменяет DOM-узлы,
+  // и клик по сохранённой ссылке уходит в никуда.
+  async function pressUntilConfirmed(stampBefore, hintBefore) {
+    for (let i = 0; i < CLICK_ATTEMPTS; i++) {
+      const btn = findBoostButton();
+      if (!btn) break;
+      if (i > 0) setStatus('work', 'повторяю клик (' + (i + 1) + ')…');
+
+      click(btn);
+      const ok = await waitConfirmed(stampBefore, hintBefore, WAIT_CONFIRM);
+      if (ok) return ok;
+
+      try { btn.click(); } catch (e) { /* ignore */ }     // нативная активация
+      const ok2 = await waitConfirmed(stampBefore, hintBefore, WAIT_CONFIRM);
+      if (ok2) return ok2;
+    }
+    return waitConfirmed(stampBefore, hintBefore, 3000);
   }
 
   function waitFor(fn, timeout) {
@@ -317,8 +337,32 @@
         return;
       }
 
+      // Разбираем висящую перепроверку: в прошлый заход клик не подтвердился,
+      // и мы специально перезагрузили страницу, чтобы узнать правду у сервера.
+      const pending = load('pendingCheck', 0);
+      if (pending) {
+        save('pendingCheck', 0);
+        const stillThere = findBoostButton();
+        if (!stillThere || isDisabled(stillThere)) {
+          save('lastBoostAt', pending);
+          save('failStreak', 0);
+          schedule(findNextTimeHint() || pending + MIN_INTERVAL, 'поднятие подтвердилось после перезагрузки');
+          log('Поднятие подтвердилось после перезагрузки', 'ok');
+          return;
+        }
+        const fails = load('failStreak', 0) + 1;
+        save('failStreak', fails);
+        log('Кнопка снова активна — прошлый клик не сработал (' + fails + ' из ' + MAX_FAILS + ')', 'warn');
+        if (fails >= MAX_FAILS) {
+          save('nextAt', 0);
+          setStatus('error', 'клик не срабатывает — остановился, нужна проверка');
+          return;
+        }
+        // иначе не выходим: сразу пробуем нажать ещё раз на этой же странице
+      }
+
       const last = load('lastBoostAt', 0);
-      if (!force && last && Date.now() - last < MIN_INTERVAL) {
+      if (!force && !pending && last && Date.now() - last < MIN_INTERVAL) {
         schedule(last + MIN_INTERVAL, 'свои 4 часа с прошлого поднятия ещё не прошли');
         return;
       }
@@ -364,16 +408,9 @@
 
       setStatus('work', 'жму кнопку…');
       const stampBefore = updatedStamp();
+      const hintBefore = findNextTimeHint();
 
-      // Сначала последовательность событий мыши — она проверена на живой странице hh.
-      click(btn);
-      let ok = await verifyBoosted(btn, stampBefore, 4000);
-
-      // Если не отозвалось — пробуем нативную активацию кнопки.
-      if (!ok) {
-        try { btn.click(); } catch (e) { /* ignore */ }
-        ok = await verifyBoosted(btn, stampBefore, WAIT_CONFIRM);
-      }
+      const ok = await pressUntilConfirmed(stampBefore, hintBefore);
 
       // Модалка с hh PRO выскакивает уже после успеха, поэтому закрываем её после проверки.
       await closeModals();
@@ -385,7 +422,13 @@
         schedule(Math.max(next, now + MIN_INTERVAL - 2 * 60 * 1000), 'поднято, ждём следующего окна');
         log('Резюме поднято', 'ok');
       } else {
-        bumpFail('клик не подтвердился');
+        // Не подтвердилось — но это ещё не значит, что не сработало. Правду знает
+        // только свежая страница: перезагрузимся через пару минут и посмотрим,
+        // активна ли кнопка. Неудачу засчитаем уже там.
+        save('pendingCheck', Date.now());
+        save('nextAt', Date.now() + PENDING_RECHECK); // без разброса: это диагностика, а не поднятие
+        setStatus('warn', 'клик без подтверждения — перепроверю на свежей странице');
+        log('Клик не подтвердился — перепроверю после перезагрузки', 'warn');
       }
     } catch (e) {
       console.error('[hh-boost]', e);
@@ -547,12 +590,21 @@
   }
 
   // ─── Старт ──────────────────────────────────────────────────────────────
-  console.log('[hh-boost] v1.3.0 загружен:', location.href);
+  console.log('[hh-boost] v1.4.0 загружен:', location.href);
   try {
     buildBadge();
     render();
     startClock();
-    run(false);
+
+    // hh отдаёт страницу с сервера уже отрисованной, а React подключает обработчики позже.
+    // Кнопка при этом видна и выглядит рабочей, но клик по ней уходит в пустоту — поэтому
+    // ждём полной загрузки и даём странице ещё несколько секунд на гидратацию.
+    const start = () => {
+      setStatus('wait', 'жду, пока страница оживёт…');
+      setTimeout(() => run(false), HYDRATION_DELAY);
+    };
+    if (document.readyState === 'complete') start();
+    else window.addEventListener('load', start, { once: true });
   } catch (e) {
     console.error('[hh-boost] не смог стартовать:', e);
   }
